@@ -4,6 +4,7 @@
 import urllib,urllib2,re,xbmcplugin,xbmcgui,sys,xbmcaddon,base64,socket,datetime,time
 from BeautifulSoup import BeautifulSoup
 import os
+import pickle
 import urlparse
 import os.path
 from xml.dom import Node;
@@ -26,6 +27,8 @@ pluginhandle = int(sys.argv[1])
 basepath = settings.getAddonInfo('path')
 resourcespath = os.path.join(basepath,"resources")
 mediapath =  os.path.join(resourcespath,"media")
+showcache = os.path.join(resourcespath, "showcache.pkl")
+maxcacheage = 6000
 
 base_url="http://tvthek.orf.at"
 schedule_url = "http://tvthek.orf.at/schedule"
@@ -52,6 +55,11 @@ sdid = "Q4A"
 opener = urllib2.build_opener()
 opener.addheaders = [('User-agent', 'Mozilla/5.0')]
 playlist = xbmc.PlayList(xbmc.PLAYLIST_VIDEO) 
+
+class Show:
+	def __init__(self, name, url):
+		self.name = name
+		self.url = url
 
 def parameters_string_to_dict(parameters):
         paramDict = {}
@@ -107,6 +115,41 @@ def addDirectory(title,banner,backdrop,link,mode):
         u = sys.argv[0] + '?' + urllib.urlencode(parameters)
         createListItem(title,banner,title,title,backdrop,u,'false',True)
 
+### Parses main page
+def parseMainPage():
+	categorydict = {}
+	try:
+		cacheage = time.time() - os.stat(showcache).st_mtime  
+	except:
+		cacheage = maxcacheage
+	
+	# if cache too old, recreate
+	if (cacheage >= maxcacheage):
+		html = opener.open(base_url)
+		html = html.read()
+		soup = BeautifulSoup(html)
+		categorymenu = soup.findAll('div',{'class':'column'})
+		for column in categorymenu:
+		   categories = column.findAll('h4')
+		   for category in categories:
+			title = cleanText(category.text.encode('UTF-8'))
+			categorydict[title] = list()
+			shows = column.findAll('a')
+			for show in shows:
+				link = "%s%s" % (base_url,show['href'])
+				categorydict[title].append(Show(cleanText(show.text.encode('UTF-8')), link))
+		# dump cache to file
+		f = open(showcache, 'wb')
+		pickle.dump(categorydict, f)
+		f.close()
+	
+	# cache ok, load from file
+	else:
+		f = open(showcache, 'rb')
+		categorydict = pickle.load(f)
+		f.close()
+	return categorydict
+	
 def getBackdrop(html,show):
     print "Getting Backdrop for %s" % show
     cssVarReg = re.compile('<link .*?href="css/themes/.*?>')
@@ -134,24 +177,70 @@ def getBackdrop(html,show):
           return backdrop
        except:
           return defaultbackdrop
-
-def getLogo(html,show):
-    print "Getting Banner for %s" % show
-    suppn = BeautifulSoup(html)
-    tmpimg = suppn.findAll('div',{'id':'more-episodes'})
-    imgpath = os.path.join(logopath, "%s.jpg" % show.replace(" ","."))
-    for string in tmpimg:
-       string = string.findAll('img')
-       for img in string:
-         if img['src'] != None and img['src'] != '':
-           urllib.urlretrieve(img['src'], imgpath)
-           if (os.path.isfile(imgpath)):
-             return defaultlogo
-           else:
-             return imgpath
-    return defaultlogo
          
+### fetches all media concerning a show
+def getBackdropAndLogo(link, asciititle):
+	# set defaults
+	backdrop = defaultbackdrop
+	logo = defaultlogo
+	html = ""
+	
+	# backdrop
+	print "Getting Backdrop for " + asciititle
+	backdropFile = os.path.join(backdroppath, "%s.png" % asciititle)
+	if (not os.path.isfile(backdropFile)):
+		html = opener.open(link)
+		html = html.read()
+		cssVarReg = re.compile('<link .*?href="css/themes/.*?>')
+		cssHrefVarReg = re.compile('href=".*?"')
+		try:
+			css = cssVarReg.search(html).group()
+			css = cssHrefVarReg.search(css).group().replace("href=","")
+			css = css.replace('"',"")
+			try:
+				css = opener.open("%s/%s" % (base_url,css))
+			except:
+				css = opener.open("%s/%s" % (base_url,css))
+			css = css.read()
+			backdropVarReg = re.compile("/image.*?_image_page.png")
+			backdrop = backdropVarReg.search(css).group()
+			backdrop = "%s%s" % (base_url, backdrop)
+			print backdrop
+			urllib.urlretrieve(backdrop, backdropFile)
+		except:
+			# create dummy file
+			open(backdropFile, "wb").close()
 
+	#only use file if it has a size, otherwise take the default 
+	if (os.path.getsize(backdropFile) != 0):
+			backdrop = backdropFile
+
+	#logo
+	print "Getting Banner for %s" % asciititle
+	imgFile = os.path.join(logopath, "%s.jpg" % asciititle)
+	if (not os.path.isfile(imgFile)):
+		if (html == ""):
+			html = opener.open(link)
+			html = html.read()
+			
+		suppn = BeautifulSoup(html)
+		tmpimg = suppn.findAll('div',{'id':'more-episodes'})
+		for string in tmpimg:
+			string = string.findAll('img')
+			for img in string:
+				if img['src'] != None and img['src'] != '':
+					urllib.urlretrieve(img['src'], imgFile)
+		# check if we have a logo, otherwise create dummy file prevents trying to fetch a non existing file over and over again
+		if (not os.path.isfile(imgFile)):
+			open(imgFile, "wb").close()
+
+	#only use file if it has a size, otherwise take the default 
+	if (os.path.getsize(imgFile) != 0):
+			logo = imgFile			
+
+	#return backdrop and logo
+	return backdrop,logo
+	
 def getMoreShows(url,logo,backdrop):
     progressbar = xbmcgui.DialogProgress()
     progressbar.create('Ladevorgang' )
@@ -304,55 +393,38 @@ def cleanText(string):
     string = string.replace('\\n', '').replace("&#160;"," ").replace("&quot;","'").replace('&amp;', '&')
     return string
 
+### creates the list of shows in a given category as XBMC directory listing
 def getCategoryList(category):
-    progressbar = xbmcgui.DialogProgress()
-    progressbar.create('Ladevorgang' )
-    progressbar.update(0)
-    category =  urllib.unquote(category)
-    print "Opening %s" % base_url
-    try:
-      html = opener.open(base_url)
-    except:
-      html = opener.open(base_url)
-    html = html.read()
-    progressbar.update(1)
-    soup = BeautifulSoup(html)
-    categorymenu = soup.findAll('div',{'class':'column'})
-    for column in categorymenu:
-       if cleanText(column.find('h4').text).encode('UTF-8') == cleanText(category):
-         shows = column.findAll('a')
-         feedcount = len(shows)
-         i = 1
-         for show in shows:
-          i = i+1
-          percent = i*100/feedcount
-          progressbar.update(percent)
-          html = ""
-          title = show.text
-          link = "%s%s" % (base_url,show['href'])
-          imgFile = os.path.join(logopath, "%s.jpg" % title.encode('ascii','ignore').replace(" ","."))
-          backdropFile = os.path.join(backdroppath, "%s.jpg" % title.encode('ascii','ignore').replace(" ","."))
-          if (not os.path.isfile(backdropFile)):
-                if html == '':
-                   html = opener.open(link)
-                   html = html.read()
-                backdrop = getBackdrop(html,title.encode('ascii','ignore'))
-          else:
-                backdrop = backdropFile
-          if (not os.path.isfile(imgFile)):
-                if html == '':
-                   html = opener.open(link)
-                   html = html.read()
-                logo = getLogo(html,title.encode('ascii','ignore'))
-          else:
-                logo = imgFile
-          parameters = {"link" : link,"title" : title.encode('UTF-8'),"mode" : "openShowList","logo":logo,"backdrop":backdrop}
-          u = sys.argv[0] + '?' + urllib.urlencode(parameters)
-          createListItem(cleanText(title),logo,cleanText(title),cleanText(title),backdrop,u,'false',True)
-    xbmcplugin.setContent(pluginhandle,'episodes')
-    xbmcplugin.endOfDirectory(pluginhandle)
-    if forceView:
-       xbmc.executebuiltin(defaultViewMode)
+	progressbar = xbmcgui.DialogProgress()
+	progressbar.create('Ladevorgang')
+	progressbar.update(0)
+	category =  urllib.unquote(category)
+	categorydict = parseMainPage()
+	progressbar.update(1)
+
+	shows = categorydict[category]
+	feedcount = len(shows)
+	i = 1
+	for show in shows:
+		title = show.name
+		link = show.url
+		asciititle = title.decode('ascii', 'ignore').replace(" ",".").replace(":","-")
+			
+		# then see that we get both
+		backdrop,logo = getBackdropAndLogo(link, asciititle)
+
+		parameters = {"link":link, "title":title, "mode":"openShowList", "logo":logo, "backdrop":backdrop}
+		u = sys.argv[0] + '?' + urllib.urlencode(parameters)
+		createListItem(title, logo, title, title, backdrop, u, 'false', True)
+
+		print i*100/feedcount
+		progressbar.update(i*100/feedcount)
+		i = i+1
+		
+	xbmcplugin.setContent(pluginhandle,'episodes')
+	xbmcplugin.endOfDirectory(pluginhandle)
+	if forceView:
+		xbmc.executebuiltin(defaultViewMode)
 
 
 def getLiveStreams():
@@ -706,30 +778,26 @@ def getTabVideos(div):
     if forceView:
        xbmc.executebuiltin(defaultViewMode)
 
+###	creates category list in XBMC directory style
 def getCategories():
-    html = opener.open(base_url)
-    html = html.read()
-    
-    soup = BeautifulSoup(html)
-    categorymenu = soup.findAll('div',{'class':'column'})
-    for column in categorymenu:
-       description = ""
-       categories = column.findAll('h4')
-       for category in categories:
-          title = category.text
-          shows = column.findAll('a')
-          for show in shows:
-             description += show.text
-             description += " | "
-          if title.encode('UTF-8') != "Wetter":
-             parameters = {"title" : title.encode('UTF-8'),"mode" : "openCategoryList","category" : title.encode('UTF-8')}
-             u = sys.argv[0] + '?' + urllib.urlencode(parameters)
-             createListItem(cleanText(title),defaultbanner,cleanText(description),cleanText(description),defaultbackdrop,u,'false',True)
-    xbmcplugin.setContent(pluginhandle,'episodes')
-    xbmcplugin.endOfDirectory(pluginhandle)
-    if forceView:
-        xbmc.executebuiltin(defaultViewMode)
+	categorydict = parseMainPage()
 	
+	# create plugin structure
+	for title in categorydict:
+		description = ""
+		for show in categorydict[title]:
+			description += show.name
+			description += " | "
+		if title != "Wetter":
+			parameters = {"title" : title,"mode" : "openCategoryList","category" : title}
+			u = sys.argv[0] + '?' + urllib.urlencode(parameters)
+			createListItem(title, defaultbanner, description, description, defaultbackdrop, u, 'false', True)
+
+	xbmcplugin.setContent(pluginhandle,'episodes')
+	xbmcplugin.endOfDirectory(pluginhandle)
+	if forceView:
+		xbmc.executebuiltin(defaultViewMode)
+ 	
 
 
 def search():
